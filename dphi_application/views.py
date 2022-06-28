@@ -1,14 +1,20 @@
 import json
+
 import uuid
 from django.http import JsonResponse
 import psycopg2
 from django.views.decorators.csrf import csrf_exempt
 from psycopg2 import IntegrityError, InternalError, DatabaseError
 import re
+import os
 import jwt
 from email_validator import validate_email, EmailNotValidError
 from config import database, username, hostname, password, port, jwt_secret
 import bcrypt
+import psycopg2.extras
+import pathlib
+
+pathlib.Path('../static/images/').mkdir(parents=True, exist_ok=True)
 
 # Global variable declaration.
 
@@ -39,7 +45,7 @@ def does_email_already_exists(email_address: str) -> bool:
 
 def does_username_already_exist(received_username: str) -> bool:
     cur = conn.cursor()
-    cur.execute("select username from users where username = %(value)s",
+    cur.execute("select username from users where user_id = %(value)s",
                 {"value": received_username})
     if cur.rowcount == 1:
         return True
@@ -133,13 +139,30 @@ def authenticate_user(request):
     try:
         received_token = request.COOKIES.get('JWT-TOKEN')
         if not received_token:
-            raise False
+            return False
         payload = jwt.decode(received_token, jwt_secret, algorithms='HS256')
         if not does_username_already_exist(payload['user_id']):
             return False
         if not payload['is_user']:
             return False
-        return True
+        return payload['user_id']
+    except KeyError:
+        return False
+    except jwt.ExpiredSignatureError:
+        return False
+
+
+def authenticate_educator(request):
+    try:
+        received_token = request.COOKIES.get('JWT-TOKEN')
+        if not received_token:
+            raise False
+        payload = jwt.decode(received_token, jwt_secret, algorithms='HS256')
+        if not educator_email_already_exists(payload['user_id']):
+            return False
+        if payload['is_user']:
+            return False
+        return payload['user_id']
     except KeyError:
         return False
     except jwt.ExpiredSignatureError:
@@ -148,7 +171,7 @@ def authenticate_user(request):
 
 def educator_email_already_exists(email_address: str):
     cur = conn.cursor()
-    cur.execute("select educator_email from educator where educator_email = %(value)s",
+    cur.execute("select educator_email from educator where educator_id = %(value)s",
                 {"value": email_address})
     if cur.rowcount == 1:
         return True
@@ -362,3 +385,52 @@ def educator_login(request) -> JsonResponse:
             return JsonResponse({"error": "The entered email don't exists."}, status=client_error)
     except KeyError:
         return JsonResponse({"error": "Required keys not found."}, status=client_error)
+
+
+@csrf_exempt
+def create_course(request) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "A POST Request was expected."}, status=client_error)
+    if not request.content_type == "application/json":
+        return JsonResponse({"error": "JSON Data was expected."}, status=client_error)
+    try:
+        received_data = json.loads(request.body.decode("utf-8"))
+        creator_id = authenticate_educator(request)
+        if not creator_id:
+            return JsonResponse({"error": "The Educator is not authenticated."}, status=client_error)
+        course_name = received_data["course_name"]
+        course_description = received_data["course_description"]
+
+        if len(course_name) < 1 or len(course_description) < 1:
+            return JsonResponse({"error": "Invalid Course Name or Course Description. This can't be empty."},
+                                status=client_error)
+
+        course_id = str(uuid.uuid4())
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "insert into course(course_id, educator_id, course_name, course_description) "
+                " values (%s,%s,%s,%s)",
+                (course_id, creator_id, course_name, course_description))
+            conn.commit()
+            return JsonResponse({"message": "Course was added successfully."})
+        except DatabaseError:
+            return JsonResponse({"error": "Database error has occured"}, status=client_error)
+    except KeyError:
+        return JsonResponse({"error": "Required fields not found."}, status=client_error)
+
+
+@csrf_exempt
+def list_courses(request) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "A POST Request was expected."}, status=client_error)
+    if not request.content_type == "application/json":
+        return JsonResponse({"error": "JSON Data was expected."}, status=client_error)
+    user_id = authenticate_user(request)
+    if not user_id:
+        return JsonResponse({"error": "The User is not authenticated."}, status=client_error)
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
+        "select course.course_id, course.course_name, course.course_description, educator.first_name, "
+        "educator.last_name from educator, course where educator.educator_id = course.educator_id")
+    return JsonResponse({"courses": cur.fetchall()})
