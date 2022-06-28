@@ -3,16 +3,16 @@ import uuid
 from django.http import JsonResponse
 import psycopg2
 from django.views.decorators.csrf import csrf_exempt
-from psycopg2 import IntegrityError
+from psycopg2 import IntegrityError, InternalError, DatabaseError
 import re
 import jwt
 from email_validator import validate_email, EmailNotValidError
 from config import database, username, hostname, password, port, jwt_secret
 import bcrypt
-import smtplib
-from smtplib import SMTPException
 
 # Global variable declaration.
+from dphi_application import models
+
 client_error = 400
 conn = psycopg2.connect(database=database, user=username, host=hostname, password=password,
                         port=port)
@@ -46,6 +46,28 @@ def does_username_already_exist(received_username: str) -> bool:
     return False
 
 
+def get_password(received_username: str):
+    try:
+        cur = conn.cursor()
+        cur.execute("select user_password from users where username = %(value)s", {"value": received_username})
+        if cur.rowcount != 1:
+            return None
+        return cur.fetchone()[0]
+    except (DatabaseError, InternalError):
+        return None
+
+
+def get_user_id(received_username: str):
+    try:
+        cur = conn.cursor()
+        cur.execute("select user_id from users where username = %(value)s", {"value": received_username})
+        if cur.rowcount != 1:
+            return None
+        return cur.fetchone()[0]
+    except (DatabaseError, InternalError):
+        return None
+
+
 def is_username_valid(received_username: str) -> bool:
     if not 3 < len(received_username) < 18:
         return False
@@ -68,8 +90,34 @@ def check_password(hashed_password: str, received_password: str) -> bool:
     return bcrypt.checkpw(received_password.encode("utf-8"), hashed_password.encode("utf-8"))
 
 
-def generate_jwt_token(user_id: str) -> str:
+def generate_jwt_token_user(user_id: str) -> str:
     return jwt.encode({"user_id": user_id, "is_user": True}, jwt_secret, algorithm='HS256')
+
+
+def get_jwt_token(request, **kwargs):
+    token = request.META['HTTP_TOKEN']
+    return token
+
+
+def decode_jwt(auth_token: str) -> str:
+    return jwt.decode(auth_token, jwt_secret, algorithms='HS256')
+
+
+def authenticate_user(request):
+    try:
+        received_token = request.COOKIES.get('JWT-TOKEN')
+        if not received_token:
+            raise False
+        payload = jwt.decode(received_token, jwt_secret, algorithms='HS256')
+        if not does_username_already_exist(payload['user_id']):
+            return False
+        if not payload['is_user']:
+            return False
+        return True
+    except KeyError:
+        return False
+    except jwt.ExpiredSignatureError:
+        return False
 
 
 def index(request) -> JsonResponse:
@@ -152,9 +200,42 @@ def user_signup(request) -> JsonResponse:
                 (user_id, received_username, email_address, first_name, last_name, country, user_password))
 
             conn.commit()
-            return JsonResponse({"user_id": generate_jwt_token(str(user_id))})
+            token = generate_jwt_token_user(str(user_id))
+            jsonResponse = JsonResponse({"message": "Success"})
+            jsonResponse.set_cookie(key="JWT-TOKEN", value=token)
+            return jsonResponse
         except IntegrityError:
             return JsonResponse({"error": "Something went wrong."}, status=client_error)
     except KeyError:
         return JsonResponse({"error": "Required field was not found. Please send null data fields too."},
                             status=client_error)
+
+
+@csrf_exempt
+def user_login(request) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "A POST Request was expected."}, status=client_error)
+    if not request.content_type == "application/json":
+        return JsonResponse({"error": "JSON Data was expected."}, status=client_error)
+    try:
+        received_data = json.loads(request.body.decode("utf-8"))
+        received_username = received_data["username"]
+        received_password = received_data["password"]
+        if not (received_username or received_password):
+            return JsonResponse({"error": "Required data was not found."}, status=client_error)
+        hashed_password = get_password(received_username)
+        if hashed_password:
+            if check_password(hashed_password, received_password):
+                user_id = get_user_id(received_username)
+                if user_id:
+                    token = generate_jwt_token_user(str(user_id))
+                    jsonResponse = JsonResponse({"message": "Success"})
+                    jsonResponse.set_cookie(key="JWT-TOKEN", value=token)
+                    return jsonResponse
+            else:
+                return JsonResponse({"error": "The Username and Password combination didn't match."},
+                                    status=client_error)
+        else:
+            return JsonResponse({"error": "The entered username don't exists."}, status=client_error)
+    except KeyError:
+        return JsonResponse({"error": "Required keys not found."}, status=client_error)
