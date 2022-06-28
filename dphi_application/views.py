@@ -11,7 +11,7 @@ from config import database, username, hostname, password, port, jwt_secret
 import bcrypt
 
 # Global variable declaration.
-from dphi_application import models
+
 
 client_error = 400
 conn = psycopg2.connect(database=database, user=username, host=hostname, password=password,
@@ -46,10 +46,32 @@ def does_username_already_exist(received_username: str) -> bool:
     return False
 
 
-def get_password(received_username: str):
+def get_user_password(received_username: str):
     try:
         cur = conn.cursor()
         cur.execute("select user_password from users where username = %(value)s", {"value": received_username})
+        if cur.rowcount != 1:
+            return None
+        return cur.fetchone()[0]
+    except (DatabaseError, InternalError):
+        return None
+
+
+def get_educator_password(received_email: str):
+    try:
+        cur = conn.cursor()
+        cur.execute("select password from educator where educator_email = %(value)s", {"value": received_email})
+        if cur.rowcount != 1:
+            return None
+        return cur.fetchone()[0]
+    except (DatabaseError, InternalError):
+        return None
+
+
+def get_educator_id(received_email: str):
+    try:
+        cur = conn.cursor()
+        cur.execute("select educator_id from educator where educator_email = %(value)s", {"value": received_email})
         if cur.rowcount != 1:
             return None
         return cur.fetchone()[0]
@@ -77,7 +99,7 @@ def is_username_valid(received_username: str) -> bool:
 
 
 def is_name_valid(first_name: str) -> bool:
-    if len(first_name) < 4:
+    if len(first_name) < 2:
         return False
     return True
 
@@ -92,6 +114,10 @@ def check_password(hashed_password: str, received_password: str) -> bool:
 
 def generate_jwt_token_user(user_id: str) -> str:
     return jwt.encode({"user_id": user_id, "is_user": True}, jwt_secret, algorithm='HS256')
+
+
+def generate_jwt_token_educator(educator_id: str) -> str:
+    return jwt.encode({"user_id": educator_id, "is_user": False}, jwt_secret, algorithm='HS256')
 
 
 def get_jwt_token(request, **kwargs):
@@ -118,6 +144,15 @@ def authenticate_user(request):
         return False
     except jwt.ExpiredSignatureError:
         return False
+
+
+def educator_email_already_exists(email_address: str):
+    cur = conn.cursor()
+    cur.execute("select educator_email from educator where educator_email = %(value)s",
+                {"value": email_address})
+    if cur.rowcount == 1:
+        return True
+    return False
 
 
 def index(request) -> JsonResponse:
@@ -185,7 +220,7 @@ def user_signup(request) -> JsonResponse:
         if does_username_already_exist(received_username):
             return JsonResponse({"error": "The entered username does already exists."}, status=client_error)
         if not is_name_valid(first_name):
-            return JsonResponse({"error": "The length of first name should be at least 3 letters."},
+            return JsonResponse({"error": "The length of first name should be at least 2 letters."},
                                 status=client_error)
 
         user_password = hash_password(user_password)
@@ -223,7 +258,7 @@ def user_login(request) -> JsonResponse:
         received_password = received_data["password"]
         if not (received_username or received_password):
             return JsonResponse({"error": "Required data was not found."}, status=client_error)
-        hashed_password = get_password(received_username)
+        hashed_password = get_user_password(received_username)
         if hashed_password:
             if check_password(hashed_password, received_password):
                 user_id = get_user_id(received_username)
@@ -237,5 +272,93 @@ def user_login(request) -> JsonResponse:
                                     status=client_error)
         else:
             return JsonResponse({"error": "The entered username don't exists."}, status=client_error)
+    except KeyError:
+        return JsonResponse({"error": "Required keys not found."}, status=client_error)
+
+
+@csrf_exempt
+def educator_signup(request) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "A POST Request was expected"}, status=client_error)
+    if not request.content_type == "application/json":
+        return JsonResponse({"error": "JSON Data was expected."}, status=client_error)
+    try:
+        received_data = json.loads(request.body.decode("utf-8"))
+
+        educator_email = received_data["educator_email"]
+        educator_first_name = received_data["educator_first_name"]
+        educator_last_name = received_data["educator_last_name"]
+        educator_country = received_data["educator_country"]
+        educator_password = received_data["educator_password"]
+
+        if not (educator_email or educator_first_name or educator_last_name or educator_country or educator_password):
+            return JsonResponse({"error": "Required fields can't be empty."}, status=client_error)
+
+        if not validate_email_address(educator_email):
+            return JsonResponse({"error": "The Email Address is invalid."}, status=client_error)
+        if educator_email_already_exists(educator_email):
+            return JsonResponse({"error": "The Email Address is already registered by other educator."},
+                                status=client_error)
+
+        if not is_name_valid(educator_first_name):
+            return JsonResponse({"error": "The length of first name should be at least 2 letters."},
+                                status=client_error)
+
+        if not is_name_valid(educator_last_name):
+            return JsonResponse({"error": "The length of last name should be at least 2 letters."}, status=client_error)
+
+        educator_password = hash_password(educator_password)
+
+        educator_id = uuid.uuid4()
+
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "insert into educator(educator_id, educator_email, first_name, last_name, country, password) "
+                " values (%s,%s,%s,%s,%s,%s)",
+                (educator_id, educator_email, educator_first_name, educator_last_name, educator_country,
+                 educator_password))
+
+            conn.commit()
+            token = generate_jwt_token_educator(str(educator_id))
+            jsonResponse = JsonResponse({"message": "Success"})
+            jsonResponse.set_cookie(key="JWT-TOKEN", value=token)
+            return jsonResponse
+        except IntegrityError:
+            return JsonResponse({"error": "Something went wrong."}, status=client_error)
+    except KeyError:
+        return JsonResponse({"error": "Required field was not found. Please send null data fields too."},
+                            status=client_error)
+
+
+@csrf_exempt
+def educator_login(request) -> JsonResponse:
+    if request.method != "POST":
+        return JsonResponse({"error": "A POST Request was expected."}, status=client_error)
+    if not request.content_type == "application/json":
+        return JsonResponse({"error": "JSON Data was expected."}, status=client_error)
+    try:
+        received_data = json.loads(request.body.decode("utf-8"))
+
+        received_email = received_data["educator_email"]
+        received_password = received_data["educator_password"]
+
+        if not (received_email or received_password):
+            return JsonResponse({"error": "Required data was not found."}, status=client_error)
+
+        hashed_password = get_educator_password(received_email)
+        if hashed_password:
+            if check_password(hashed_password, received_password):
+                educator_id = get_educator_id(received_email)
+                if educator_id:
+                    token = generate_jwt_token_educator(str(educator_id))
+                    jsonResponse = JsonResponse({"message": "Success"})
+                    jsonResponse.set_cookie(key="JWT-TOKEN", value=token)
+                    return jsonResponse
+            else:
+                return JsonResponse({"error": "The Email and Password combination didn't match."},
+                                    status=client_error)
+        else:
+            return JsonResponse({"error": "The entered email don't exists."}, status=client_error)
     except KeyError:
         return JsonResponse({"error": "Required keys not found."}, status=client_error)
